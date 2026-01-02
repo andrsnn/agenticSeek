@@ -48,6 +48,15 @@ def pretty_print(text, color="info", no_newline=False):
             - "output": Cyan
             - "default": Black (Windows only)
     """
+    # Best-effort tee to trace file (if enabled).
+    try:
+        from sources.runtime_context import trace_event, get_run_context
+        ctx = get_run_context()
+        if ctx is not None and ctx.is_trace_enabled():
+            trace_event("print", text=text, color=color)
+    except Exception:
+        pass
+
     thinking_event.set()
     if current_animation_thread and current_animation_thread.is_alive():
         current_animation_thread.join()

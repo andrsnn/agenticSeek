@@ -15,6 +15,7 @@ from sources.agents.browser_agent import BrowserAgent
 from sources.language import LanguageUtility
 from sources.utility import pretty_print, animate_thinking, timer_decorator
 from sources.logger import Logger
+from sources.runtime_context import get_run_context
 
 class AgentRouter:
     """
@@ -438,6 +439,31 @@ class AgentRouter:
         self.logger.error("Planner agent not found.")
         return None
     
+    def _has_complexity_keywords(self, text: str) -> bool:
+        """
+        Check if text contains keywords that indicate HIGH complexity.
+        These override the ML classifier to ensure multi-step tasks go to planner.
+        """
+        lower = text.lower()
+        # Multi-step indicators
+        if any(kw in lower for kw in [
+            "output a report", "create a csv", "save to file", "write a report",
+            "make a report", "generate a report", "export to", "save results",
+            "and then", "after that", "finally", "multiple", "several",
+            "compare", "analyze and", "research and", "find and save",
+            "collect and", "gather and", "search and create",
+        ]):
+            return True
+        # Multiple questions (likely multi-step)
+        question_marks = lower.count("?")
+        if question_marks >= 2:
+            return True
+        # Long queries with multiple sentences often need planning
+        sentences = [s.strip() for s in text.replace("?", ".").replace("!", ".").split(".") if s.strip()]
+        if len(sentences) >= 3:
+            return True
+        return False
+
     def select_agent(self, text: str) -> Agent:
         """
         Select the appropriate agent based on the text.
@@ -450,25 +476,66 @@ class AgentRouter:
         if len(self.agents) == 1:
             return self.agents[0]
         lang = self.lang_analysis.detect_language(text)
-        text = self.find_first_sentence(text)
-        text = self.lang_analysis.translate(text, lang)
+
+        # Check full text for complexity keywords BEFORE truncating to first sentence
+        if self._has_complexity_keywords(text):
+            pretty_print(f"Complex task detected (keyword match), routing to planner agent.", color="info")
+            candidate = self.find_planner_agent()
+            return self._apply_agent_policy(candidate) if candidate else None
+
+        first_sentence = self.find_first_sentence(text)
+        first_sentence = self.lang_analysis.translate(first_sentence, lang)
         labels = [agent.role for agent in self.agents]
-        complexity = self.estimate_complexity(text)
+        complexity = self.estimate_complexity(first_sentence)
         if complexity == "HIGH":
             pretty_print(f"Complex task detected, routing to planner agent.", color="info")
-            return self.find_planner_agent()
+            candidate = self.find_planner_agent()
+            return self._apply_agent_policy(candidate) if candidate else None
         try:
-            best_agent = self.router_vote(text, labels, log_confidence=False)
+            best_agent = self.router_vote(first_sentence, labels, log_confidence=False)
         except Exception as e:
             raise e
         for agent in self.agents:
             if best_agent == agent.role:
                 role_name = agent.role
-                pretty_print(f"Selected agent: {agent.agent_name} (roles: {role_name})", color="warning")
-                return agent
+                # This is normal routing info, not a warning.
+                pretty_print(f"Selected agent: {agent.agent_name} (roles: {role_name})", color="info")
+                return self._apply_agent_policy(agent)
         pretty_print(f"Error choosing agent.", color="failure")
         self.logger.error("No agent selected.")
         return None
+
+    def _apply_agent_policy(self, selected: Agent) -> Agent:
+        """
+        Enforce per-run agent configuration (e.g. disable coder agent).
+        """
+        if selected is None:
+            return None
+        ctx = get_run_context()
+        if ctx is None or getattr(ctx, "agent_config", None) is None:
+            return selected
+        try:
+            if ctx.agent_config.allow_agent(selected.type, selected.role):
+                return selected
+        except Exception:
+            return selected
+
+        # Fallback: prefer planner if allowed, else first allowed agent.
+        pretty_print(f"Agent '{selected.type}' is disabled by settings. Falling back.", color="warning")
+        planner = self.find_planner_agent()
+        if planner is not None:
+            try:
+                if ctx.agent_config.allow_agent(planner.type, planner.role):
+                    return planner
+            except Exception:
+                return planner
+        for agent in self.agents:
+            try:
+                if ctx.agent_config.allow_agent(agent.type, agent.role):
+                    return agent
+            except Exception:
+                continue
+        return selected
 
 if __name__ == "__main__":
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

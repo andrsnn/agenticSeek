@@ -60,3 +60,5 @@ Now that I know how to use the MCP, I will choose the search-stock-news tool and
 }
 ```
 
+Reliability rule:
+- Prefer saying “I don’t know / I can’t verify that” over hallucinating. The user can verify against raw browser logs and trace.jsonl, so do not fabricate quotes/links/timestamps.

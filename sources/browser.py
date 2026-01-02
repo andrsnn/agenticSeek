@@ -29,6 +29,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sources.utility import pretty_print, animate_thinking
 from sources.logger import Logger
+from sources.runtime_context import trace_event, get_run_context
+from sources.activity_bus import emit_activity
 
 
 def get_chrome_path() -> str:
@@ -244,23 +246,57 @@ def create_driver(headless=False, stealth_mode=True, crx_path="./crx/nopecha.crx
         return webdriver.Chrome(service=service, options=chrome_options)
 
 class Browser:
-    def __init__(self, driver, anticaptcha_manual_install=False):
+    def __init__(
+        self,
+        driver,
+        anticaptcha_manual_install: bool = False,
+        driver_factory=None,
+    ):
         """Initialize the browser with optional AntiCaptcha installation."""
         self.js_scripts_folder = "./sources/web_scripts/" if not __name__ == "__main__" else "./web_scripts/"
         self.anticaptcha = "https://chrome.google.com/webstore/detail/nopecha-captcha-solver/dknlfmjaanfblgfdfebhijalfmhmjjjo/related"
         self.logger = Logger("browser.log")
-        self.screenshot_folder = os.path.join(os.getcwd(), ".screenshots")
+        self._driver_factory = driver_factory
+        # Prefer the mounted workspace in Docker so screenshots are visible on the host.
+        base_dir = os.getenv("WORK_DIR") or os.getcwd()
+        self.screenshot_folder = os.path.join(base_dir, ".screenshots")
         self.tabs = []
         try:
             self.driver = driver
             self.wait = WebDriverWait(self.driver, 10)
         except Exception as e:
             raise Exception(f"Failed to initialize browser: {str(e)}")
+
+        # Hard timeouts to prevent indefinite navigation stalls.
+        # You can override via env vars.
+        try:
+            # Keep defaults conservative to avoid breaking sites that legitimately load slowly.
+            page_load_timeout = float(os.getenv("AGENTICSEEK_BROWSER_PAGELOAD_TIMEOUT_S", "120"))
+            script_timeout = float(os.getenv("AGENTICSEEK_BROWSER_SCRIPT_TIMEOUT_S", "60"))
+            self.driver.set_page_load_timeout(max(5.0, page_load_timeout))
+            self.driver.set_script_timeout(max(5.0, script_timeout))
+        except Exception:
+            pass
+
         self.setup_tabs()
         self.patch_browser_fingerprint()
         if anticaptcha_manual_install:
             self.load_anticatpcha_manually()
-    
+
+    def _emit_activity(self, text: str, color: str = "status") -> None:
+        """
+        Emit a best-effort Activity line (never raise). This is critical for diagnosing stalls.
+        """
+        try:
+            ctx = get_run_context()
+        except Exception:
+            ctx = None
+        rid = getattr(ctx, "run_id", None) if ctx is not None else None
+        try:
+            emit_activity("print", run_id=rid, text=str(text), color=str(color))
+        except Exception:
+            return
+
     def setup_tabs(self):
         self.tabs = self.driver.window_handles
         try:
@@ -306,9 +342,26 @@ class Browser:
     def go_to(self, url:str) -> bool:
         """Navigate to a specified URL."""
         time.sleep(random.uniform(0.4, 2.5))
+        t0 = time.time()
+        self._emit_activity(f"Browser: navigate start → {url}", color="status")
+        trace_event("browser_navigate", state="start", url=url)
         try:
+            before_url = None
+            try:
+                before_url = self.driver.current_url
+            except Exception:
+                before_url = None
             initial_handles = self.driver.window_handles
-            self.driver.get(url)
+            # Navigate on the main thread (threaded driver.get watchdog can deadlock the process).
+            # If page load timeout triggers, stop the load and continue best-effort.
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                try:
+                    self._emit_activity(f"Browser: page load timeout; stopping load for {url}", color="warning")
+                    self.driver.execute_script("window.stop();")
+                except Exception:
+                    pass
             time.sleep(random.uniform(0.01, 0.3))
             try:
                 wait = WebDriverWait(self.driver, timeout=10)
@@ -323,16 +376,47 @@ class Browser:
             self.apply_web_safety()
             time.sleep(random.uniform(0.01, 0.2))
             self.human_scroll()
-            self.logger.log(f"Navigated to: {url}")
+            final_url = None
+            title = None
+            try:
+                final_url = self.driver.current_url
+                title = self.driver.title
+            except Exception:
+                final_url = None
+                title = None
+            self.logger.log(f"Navigated to: {final_url or url}")
+            # Always record the *actual* URL we ended up on (post-redirect), not just the requested URL.
+            ctx = get_run_context()
+            if ctx is None or getattr(ctx.trace_config, "save_web_navigation", True):
+                trace_event(
+                    "browser_visited",
+                    requested_url=url,
+                    final_url=final_url,
+                    before_url=before_url,
+                    redirected=bool(before_url and final_url and before_url != final_url and url != final_url),
+                    title=title,
+                )
+            dt = time.time() - t0
+            self._emit_activity(f"Browser: navigate done ({dt:.1f}s) → {final_url or url}", color="status")
+            trace_event("browser_navigate", state="end", url=url, final_url=final_url, seconds=dt)
             return True
         except TimeoutException as e:
             self.logger.error(f"Timeout waiting for {url} to load: {str(e)}")
+            dt = time.time() - t0
+            self._emit_activity(f"Browser: navigate FAILED timeout after {dt:.1f}s → {url}", color="failure")
+            trace_event("browser_navigate", state="timeout", url=url, seconds=dt, error=str(e))
             return False
         except WebDriverException as e:
             self.logger.error(f"Error navigating to {url}: {str(e)}")
+            dt = time.time() - t0
+            self._emit_activity(f"Browser: navigate FAILED ({type(e).__name__}) after {dt:.1f}s → {url}", color="failure")
+            trace_event("browser_navigate", state="error", url=url, seconds=dt, error=str(e))
             return False
         except Exception as e:
             self.logger.error(f"Fatal error with go_to method on {url}:\n{str(e)}")
+            dt = time.time() - t0
+            self._emit_activity(f"Browser: navigate CRASH ({type(e).__name__}) after {dt:.1f}s → {url}", color="failure")
+            trace_event("browser_navigate", state="crash", url=url, seconds=dt, error=str(e))
             raise e
 
     def is_sentence(self, text:str) -> bool:
@@ -436,6 +520,11 @@ class Browser:
     def click_element(self, xpath: str) -> bool:
         """Click an element specified by XPath."""
         try:
+            before_url = None
+            try:
+                before_url = self.driver.current_url
+            except Exception:
+                before_url = None
             element = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
             if not element.is_displayed():
                 return False
@@ -447,6 +536,23 @@ class Browser:
                 time.sleep(0.1)
                 element.click()
                 self.logger.info(f"Clicked element at {xpath}")
+                # If click caused navigation, record the actual URL.
+                try:
+                    time.sleep(0.2)
+                    after_url = self.driver.current_url
+                    if after_url and before_url and after_url != before_url:
+                        ctx = get_run_context()
+                        if ctx is None or getattr(ctx.trace_config, "save_web_navigation", True):
+                            trace_event(
+                                "browser_navigated",
+                                trigger="click",
+                                xpath=xpath,
+                                before_url=before_url,
+                                final_url=after_url,
+                                title=getattr(self.driver, "title", None),
+                            )
+                except Exception:
+                    pass
                 return True
             except ElementClickInterceptedException as e:
                 self.logger.error(f"Error click_element: {str(e)}")
@@ -533,12 +639,31 @@ class Browser:
         """
         try:
             self.logger.info("Waiting for submission outcome...")
+            before_url = None
+            try:
+                before_url = self.driver.current_url
+            except Exception:
+                before_url = None
             wait = WebDriverWait(self.driver, timeout)
             wait.until(
-                lambda driver: driver.current_url != self.driver.current_url or
+                lambda driver: (before_url is not None and driver.current_url != before_url) or
                                driver.find_elements(By.XPATH, "//*[contains(text(), 'success')]")
             )
             self.logger.info("Detected submission outcome")
+            try:
+                after_url = self.driver.current_url
+                if after_url and before_url and after_url != before_url:
+                    ctx = get_run_context()
+                    if ctx is None or getattr(ctx.trace_config, "save_web_navigation", True):
+                        trace_event(
+                            "browser_navigated",
+                            trigger="submission",
+                            before_url=before_url,
+                            final_url=after_url,
+                            title=getattr(self.driver, "title", None),
+                        )
+            except Exception:
+                pass
             return True
         except TimeoutException:
             self.logger.warning("No submission outcome detected")
@@ -720,6 +845,18 @@ class Browser:
     
     def get_screenshot(self) -> str:
         return self.screenshot_folder + "/updated_screen.png"
+
+    def get_screenshot_folder(self) -> str:
+        return self.screenshot_folder
+
+    def screenshot_named(self, filename: str) -> str | None:
+        """
+        Take a screenshot and return the absolute file path if successful, else None.
+        """
+        ok = self.screenshot(filename=filename)
+        if not ok:
+            return None
+        return os.path.join(self.screenshot_folder, filename)
 
     def screenshot(self, filename:str = 'updated_screen.png') -> bool:
         """Take a screenshot of the current page, attempt to capture the full page by zooming out."""

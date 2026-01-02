@@ -55,7 +55,7 @@ class Provider:
         api_key = os.getenv(api_key_var)
         if not api_key:
             pretty_print(f"API key {api_key_var} not found in .env file. Please add it", color="warning")
-            exit(1)
+            raise ValueError(f"Missing API key: {api_key_var}")
         return api_key
     
     def get_internal_url(self):
@@ -65,14 +65,18 @@ class Provider:
             return "http://localhost", False
         return url, True
 
-    def respond(self, history, verbose=True):
+    def respond(self, history, verbose=True, timeout_s: float | None = None):
         """
         Use the choosen provider to generate text.
         """
         llm = self.available_providers[self.provider_name]
         self.logger.info(f"Using provider: {self.provider_name} at {self.server_ip}")
         try:
-            thought = llm(history, verbose)
+            # Optional per-call timeout (best-effort; only some providers implement).
+            if self.provider_name == "ollama":
+                thought = llm(history, verbose, timeout_s=timeout_s)
+            else:
+                thought = llm(history, verbose)
         except KeyboardInterrupt:
             self.logger.warning("User interrupted the operation with Ctrl+C")
             return "Operation interrupted by user. REQUEST_EXIT"
@@ -155,7 +159,7 @@ class Provider:
             raise e
         return thought
 
-    def ollama_fn(self, history, verbose=False):
+    def ollama_fn(self, history, verbose=False, timeout_s: float | None = None):
         """
         Use local or remote Ollama server to generate text.
         """
@@ -164,6 +168,26 @@ class Provider:
         client = OllamaClient(host=host)
 
         try:
+            # If a timeout is requested, use a single non-streaming HTTP call with httpx timeouts.
+            # This prevents the streaming generator from hanging forever and wedging threads.
+            if timeout_s is not None:
+                try:
+                    url = host.rstrip("/") + "/api/chat"
+                    t = float(timeout_s)
+                    t = max(2.0, min(600.0, t))
+                    with httpx.Client(timeout=httpx.Timeout(t)) as hc:
+                        r = hc.post(url, json={"model": self.model, "messages": history, "stream": False})
+                        r.raise_for_status()
+                        data = r.json() if r is not None else {}
+                    content = ""
+                    try:
+                        content = (data or {}).get("message", {}).get("content", "")
+                    except Exception:
+                        content = ""
+                    return content or "Error: Ollama returned an empty response."
+                except Exception as e:
+                    # Fall through to legacy streaming path (some setups may not support /api/chat).
+                    self.logger.warning(f"Ollama timeout path failed; falling back to streaming: {str(e)}")
             stream = client.chat(
                 model=self.model,
                 messages=history,
@@ -178,6 +202,28 @@ class Provider:
                 f"\nOllama connection failed at {host}. Check if the server is running."
             ) from e
         except Exception as e:
+            # Defensive fallback: some Ollama models/versions can emit malformed tool-call
+            # structures during streaming, raising "error parsing tool call".
+            if "error parsing tool call" in str(e).lower():
+                self.logger.warning(
+                    f"Ollama tool-call parsing error during streaming; retrying without streaming: {str(e)}"
+                )
+                try:
+                    resp = client.chat(
+                        model=self.model,
+                        messages=history,
+                        stream=False,
+                    )
+                    # Ollama python client returns dict-like payloads.
+                    content = ""
+                    try:
+                        content = resp.get("message", {}).get("content", "")
+                    except Exception:
+                        content = ""
+                    return content or "Error: Ollama returned an empty response after retry."
+                except Exception as retry_err:
+                    self.logger.error(f"Ollama retry without streaming failed: {str(retry_err)}")
+                    return f"Error: Ollama failed: {str(retry_err)}"
             if hasattr(e, 'status_code') and e.status_code == 404:
                 animate_thinking(f"Downloading {self.model}...")
                 client.pull(self.model)

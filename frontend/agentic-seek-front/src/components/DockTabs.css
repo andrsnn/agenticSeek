@@ -1,0 +1,99 @@
+.docktabs {
+  width: 100%;
+}
+
+.docktabs-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.docktabs-side {
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+  min-width: 44px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.docktabs-pane-btn {
+  border: 1px solid var(--border);
+  background: var(--secondary);
+  color: var(--muted-foreground);
+  border-radius: 10px;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.docktabs-pane-btn:hover {
+  color: var(--foreground);
+  border-color: var(--accent);
+}
+
+.docktabs-tabs {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  overflow: auto;
+  padding-bottom: 2px;
+}
+
+.docktabs-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--secondary);
+  color: var(--foreground);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.docktabs-tab.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.docktabs-tabtitle {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.docktabs-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.docktabs-icon {
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0 2px;
+}
+
+.docktabs-icon:hover {
+  color: var(--foreground);
+}
+
+.docktabs-plus {
+  flex-shrink: 0;
+}
+
+.docktabs-select {
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--secondary);
+  color: var(--foreground);
+  font-size: 0.8rem;
+}

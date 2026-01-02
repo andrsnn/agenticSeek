@@ -10,6 +10,8 @@ RUN apt-get update -y && apt-get install -y \
     unzip \
     xvfb \
     libxss1 \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     #libappindicator1 \
     fonts-liberation \
     libnss3 \
@@ -84,7 +86,10 @@ RUN chmod +x /opt/chrome/chrome
 RUN pip3 install --upgrade pip setuptools wheel
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Use BuildKit cache for pip downloads/wheels so rebuilds don't re-download/reinstall everything.
+# (Requires BuildKit, enabled by default on modern Docker Desktop.)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 RUN mkdir -p /opt/workspace
 RUN mkdir -p /tmp && chmod 1777 /tmp

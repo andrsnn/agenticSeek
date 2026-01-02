@@ -11,6 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 from sources.memory import Memory
 from sources.utility import pretty_print
 from sources.schemas import executorResult
+from sources.runtime_context import trace_event
+from sources.runtime_context import get_run_context
+from sources import artifacts
 
 random.seed(time.time())
 
@@ -43,6 +46,9 @@ class Agent():
         self.tools = {}
         self.blocks_result = []
         self.success = True
+        self.executed_blocks_last_call = 0
+        self.had_tool_parse_error_last_call = False
+        self.last_llm_response_empty = False
         self.last_answer = ""
         self.last_reasoning = ""
         self.status_message = "Haven't started yet"
@@ -126,6 +132,43 @@ class Agent():
         """
         self.stop = True
         self.status_message = "Stopped"
+
+    def reset_run_state(self) -> None:
+        """
+        Reset volatile per-run state so a previous stop/failure doesn't poison future tasks.
+        Does NOT clear long-term memory.
+        """
+        self.stop = False
+        self.status_message = "Ready"
+        self.success = True
+        self.executed_blocks_last_call = 0
+        self.had_tool_parse_error_last_call = False
+        self.last_llm_response_empty = False
+
+    def apply_run_context(self) -> None:
+        """
+        Apply the current RunContext to this agent so all tool/file writes go under the per-run output dir.
+        """
+        ctx = get_run_context()
+        if ctx is None:
+            return
+        out_dir = getattr(ctx, "output_dir", None)
+        if not out_dir:
+            return
+        # Update agent working directory
+        try:
+            self.current_directory = out_dir
+        except Exception:
+            pass
+        # Update all tool work dirs (Tools subclasses use tool.work_dir for writes/cwd)
+        try:
+            for tool in (self.tools or {}).values():
+                try:
+                    setattr(tool, "work_dir", out_dir)
+                except Exception:
+                    continue
+        except Exception:
+            return
     
     @abstractmethod
     def process(self, prompt, speech_module) -> str:
@@ -162,18 +205,60 @@ class Agent():
         Asynchronously ask the LLM to process the prompt.
         """
         self.status_message = "Thinking..."
+        trace_event("llm_working", agent=self.type, state="start")
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self.sync_llm_request)
+        try:
+            return await loop.run_in_executor(self.executor, self.sync_llm_request)
+        finally:
+            trace_event("llm_working", agent=self.type, state="end")
     
     def sync_llm_request(self) -> Tuple[str, str]:
         """
         Ask the LLM to process the prompt and return the answer and the reasoning.
         """
         memory = self.memory.get()
-        thought = self.llm.respond(memory, self.verbose)
+        try:
+            # Defensive: providers can occasionally return empty/None responses.
+            thought = None
+            for _ in range(3):
+                thought = self.llm.respond(memory, self.verbose)
+                if thought is not None and str(thought).strip() != "":
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            # Defensive: provider failures should not crash the whole agentic process.
+            # Convert to a normal agent failure that can be surfaced to the user/UI.
+            self.success = False
+            err_summary = f"Error: LLM provider failed ({type(e).__name__}): {str(e)}"
+            # Don't push provider stack/garbage into memory; just return a stable message.
+            return "Error: LLM provider failed. Please retry.", err_summary
+
+        if thought is None or str(thought).strip() == "":
+            # Treat as transient; let the calling agent loop retry (bounded by max turns).
+            self.last_llm_response_empty = True
+            self.success = False
+            return "Error: LLM returned an empty response. Retrying...", "Error: empty LLM response"
+        self.last_llm_response_empty = False
 
         reasoning = self.extract_reasoning_text(thought)
         answer = self.remove_reasoning_text(thought)
+        # Trace the model output *excluding* internal reasoning.
+        ctx = get_run_context()
+        if ctx is not None and ctx.is_trace_enabled() and getattr(ctx.trace_config, "outputs_format", "jsonl_only") == "jsonl_only":
+            trace_event("llm_answer", agent=self.type, answer=answer)
+        else:
+            trace_event("llm_answer", agent=self.type, answer_preview=answer[:2000])
+        # Persist intermediate outputs (useful for mid-run structured reports).
+        if ctx is not None and ctx.is_trace_enabled() and ctx.trace_config.save_intermediate_outputs:
+            # Store full answer as a snapshot (markdown) under the run folder
+            snap_path = artifacts.write_markdown_snapshot(
+                kind=f"llm_{self.type}",
+                title=f"LLM output ({self.type})",
+                body=answer,
+            )
+            # Also append a pointer into chat transcript (instead of dumping huge content).
+            if snap_path and getattr(ctx.trace_config, "save_chat_transcript", False):
+                artifacts.append_chat(f"[LLM_OUTPUT] ({self.type}) saved: {snap_path}")
         self.memory.push('assistant', answer)
         return answer, reasoning
     
@@ -256,30 +341,89 @@ class Agent():
         """
         Execute all the tools the agent has and return the result.
         """
+        # Track whether any new tool blocks were executed during this call.
+        # Some agents use this to decide when to stop looping.
+        start_blocks_len = len(self.blocks_result)
+        self.had_tool_parse_error_last_call = False
+        parse_errors = []
         feedback = ""
         success = True
         blocks = None
         if answer.startswith("```"):
             answer = "I will execute:\n" + answer # there should always be a text before blocks for the function that display answer
 
-        self.success = True
+        # Do NOT reset self.success here.
+        # self.success should reflect overall task success for the current agent run.
+        # If a tool fails, we set self.success=False and keep it False unless a later tool run succeeds.
         for name, tool in self.tools.items():
             feedback = ""
             blocks, save_path = tool.load_exec_block(answer)
+            ctx = get_run_context()
+            # Enforce per-run tool config (if present)
+            if ctx is not None and hasattr(ctx, "tool_config") and ctx.tool_config is not None:
+                tool_tag = getattr(tool, "tag", None)
+                allowed = ctx.tool_config.allow_tool(tool_key=name, tool_tag=tool_tag)
+                if blocks and not allowed:
+                    feedback = f"Tool '{name}' is disabled by user settings. Choose another allowed tool."
+                    self.success = False
+                    self.memory.push('user', feedback)
+                    trace_event("tool_disabled", agent=self.type, tool=name, tool_tag=tool_tag)
+                    self.executed_blocks_last_call = len(self.blocks_result) - start_blocks_len
+                    return False, feedback
+            tool_parse_err = getattr(tool, "last_parse_error", None)
+            if tool_parse_err:
+                self.had_tool_parse_error_last_call = True
+                parse_errors.append(f"{name}: {tool_parse_err}")
+                trace_event("tool_parse_error", agent=self.type, tool=name, error=tool_parse_err)
 
-            if blocks != None:
+            if blocks:
                 pretty_print(f"Executing {len(blocks)} {name} blocks...", color="status")
+                trace_event("tool_execute_start", agent=self.type, tool=name, blocks_count=len(blocks))
                 for block in blocks:
                     self.show_block(block)
                     output = tool.execute([block])
                     feedback = tool.interpreter_feedback(output) # tool interpreter feedback
                     success = not tool.execution_failure_check(output)
                     self.blocks_result.append(executorResult(block, feedback, success, name))
+                    # Persist raw tool output to per-run artifacts (Raw mode).
+                    out_path = None
+                    ctx2 = get_run_context()
+                    if ctx2 is not None and ctx2.is_trace_enabled() and getattr(ctx2.trace_config, "save_tool_outputs", False):
+                        # In jsonl_only mode, keep everything in trace.jsonl instead of extra files.
+                        if getattr(ctx2.trace_config, "outputs_format", "jsonl_only") != "jsonl_only":
+                            out_path = artifacts.write_tool_output(name, output)
+                            if out_path and getattr(ctx2.trace_config, "save_chat_transcript", False):
+                                artifacts.append_chat(f"[TOOL_OUTPUT] {name} saved: {out_path}")
+                    trace_event(
+                        "tool_executed",
+                        agent=self.type,
+                        tool=name,
+                        success=success,
+                        feedback=feedback,
+                        block=block,
+                        output=output,
+                        output_path=out_path,
+                    )
                     if not success:
                         self.success = False
                         self.memory.push('user', feedback)
+                        self.executed_blocks_last_call = len(self.blocks_result) - start_blocks_len
                         return False, feedback
                 self.memory.push('user', feedback)
+                # If we executed blocks and none failed, mark the agent as successful (recovery possible).
+                self.success = True
                 if save_path != None:
                     tool.save_block(blocks, save_path)
+        self.executed_blocks_last_call = len(self.blocks_result) - start_blocks_len
+
+        # If the model attempted tool usage but the tool blocks were malformed, ask it to retry.
+        if self.executed_blocks_last_call == 0 and self.had_tool_parse_error_last_call:
+            feedback = (
+                "Tool block parse error(s) detected:\n- "
+                + "\n- ".join(parse_errors)
+                + f"\n\nPlease resend the tool block(s) with correct fenced code blocks like ```{self.get_last_tool_type() or '<tool>'}``` ... ```."
+            )
+            self.success = False
+            self.memory.push('user', feedback)
+            return False, feedback
         return True, feedback

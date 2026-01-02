@@ -1,0 +1,233 @@
+"""
+write_output - A canonical tool for agents to write output files.
+
+This tool handles all file output (CSV, XLSX, Markdown, TXT) with proper
+cross-platform path handling. Files are automatically written to the
+current run's output directory.
+
+Usage:
+```write_output
+format=csv
+filename=results
+data=Name,Age,City
+John,30,NYC
+Jane,25,LA
+```
+
+Or for markdown/text:
+```write_output
+format=md
+filename=report
+title=My Research Report
+content=## Summary
+This is the summary...
+```
+
+Supported formats: csv, xlsx, md, txt
+"""
+
+import os
+import sys
+import csv
+import io
+from datetime import datetime
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from sources.tools.tools import Tools
+
+
+class WriteOutput(Tools):
+    """
+    Canonical tool for writing output files (CSV, XLSX, Markdown, TXT).
+
+    All files are written to the current run's output directory automatically.
+    The agent only needs to specify format, filename, and data.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.tag = "write_output"
+        self.name = "Write Output"
+        self.description = (
+            "Write output files (CSV, Markdown, TXT). "
+            "Parameters: format=csv|md|txt, filename=..., data=... (or content=... for md/txt, title=... optional). "
+            "Files are automatically saved to the run output folder."
+        )
+
+    def _get_output_dir(self) -> str:
+        """Get the output directory from run context, falling back to work_dir."""
+        try:
+            from sources.runtime_context import get_run_context
+            ctx = get_run_context()
+            if ctx and ctx.output_dir:
+                return ctx.output_dir
+            if ctx and ctx.work_dir:
+                return ctx.work_dir
+        except Exception:
+            pass
+        return self.work_dir
+
+    def _safe_filename(self, filename: str, ext: str) -> str:
+        """Sanitize filename and ensure correct extension."""
+        # Remove any path components - just keep the filename
+        name = os.path.basename(str(filename).strip())
+        # Remove any existing extension
+        name = os.path.splitext(name)[0]
+        # Sanitize: keep alphanumeric, underscores, hyphens, spaces
+        safe_chars = []
+        for c in name:
+            if c.isalnum() or c in "_- ":
+                safe_chars.append(c)
+        name = "".join(safe_chars).strip() or "output"
+        # Add timestamp to avoid overwrites
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{name}_{timestamp}.{ext}"
+
+    def _write_csv(self, output_dir: str, filename: str, data: str) -> str:
+        """Write CSV data to file."""
+        safe_name = self._safe_filename(filename, "csv")
+        target_path = os.path.join(output_dir, safe_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Parse the data as CSV lines
+        lines = data.strip().split("\n")
+        with open(target_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            for line in lines:
+                # Handle CSV parsing properly
+                reader = csv.reader(io.StringIO(line))
+                for row in reader:
+                    writer.writerow(row)
+
+        return target_path
+
+    def _write_xlsx(self, output_dir: str, filename: str, data: str) -> str:
+        """Write XLSX data to file (falls back to CSV if openpyxl not available)."""
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            # Fall back to CSV
+            print("[write_output] openpyxl not available, falling back to CSV")
+            return self._write_csv(output_dir, filename, data)
+
+        safe_name = self._safe_filename(filename, "xlsx")
+        target_path = os.path.join(output_dir, safe_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        wb = Workbook()
+        ws = wb.active
+        lines = data.strip().split("\n")
+        for row_idx, line in enumerate(lines, 1):
+            reader = csv.reader(io.StringIO(line))
+            for row in reader:
+                for col_idx, value in enumerate(row, 1):
+                    ws.cell(row=row_idx, column=col_idx, value=value)
+        wb.save(target_path)
+        return target_path
+
+    def _write_markdown(self, output_dir: str, filename: str, content: str, title: str = None) -> str:
+        """Write Markdown file."""
+        safe_name = self._safe_filename(filename, "md")
+        target_path = os.path.join(output_dir, safe_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        md_content = ""
+        if title:
+            md_content += f"# {title}\n\n"
+        md_content += f"*Generated: {timestamp}*\n\n---\n\n"
+        md_content += content.strip()
+        md_content += "\n\n---\n*Generated by AgenticSeek*\n"
+
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        return target_path
+
+    def _write_txt(self, output_dir: str, filename: str, content: str, title: str = None) -> str:
+        """Write plain text file."""
+        safe_name = self._safe_filename(filename, "txt")
+        target_path = os.path.join(output_dir, safe_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        txt_content = ""
+        if title:
+            txt_content += f"{title}\n{'=' * len(title)}\n\n"
+        txt_content += content.strip()
+        txt_content += "\n"
+
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(txt_content)
+        return target_path
+
+    def execute(self, blocks: list, safety: bool = False) -> str:
+        if not blocks:
+            return "Error: No write_output blocks provided."
+
+        results = []
+        output_dir = self._get_output_dir()
+
+        for block in blocks:
+            try:
+                fmt = (self.get_parameter_value(block, "format") or "").lower().strip()
+                filename = self.get_parameter_value(block, "filename") or "output"
+
+                # Get data/content
+                data = self.get_parameter_value(block, "data")
+                content = self.get_parameter_value(block, "content") or self.get_parameter_value(block, "text")
+                title = self.get_parameter_value(block, "title")
+
+                if fmt in ("csv", "xlsx"):
+                    if not data:
+                        return "Error: 'data' parameter required for CSV/XLSX format. Provide CSV rows."
+                    if fmt == "csv":
+                        path = self._write_csv(output_dir, filename, data)
+                    else:
+                        path = self._write_xlsx(output_dir, filename, data)
+                    row_count = len(str(data).strip().split("\n"))
+                    results.append(f"SUCCESS: Created {fmt.upper()} file ({row_count} rows): {path}")
+
+                elif fmt in ("md", "markdown"):
+                    if not content and not data:
+                        return "Error: 'content' parameter required for Markdown format."
+                    file_content = content or data
+                    path = self._write_markdown(output_dir, filename, file_content, title)
+                    char_count = len(str(file_content))
+                    results.append(f"SUCCESS: Created Markdown file ({char_count} chars): {path}")
+
+                elif fmt in ("txt", "text"):
+                    if not content and not data:
+                        return "Error: 'content' parameter required for TXT format."
+                    file_content = content or data
+                    path = self._write_txt(output_dir, filename, file_content, title)
+                    char_count = len(str(file_content))
+                    results.append(f"SUCCESS: Created text file ({char_count} chars): {path}")
+
+                else:
+                    return f"Error: Unknown format '{fmt}'. Use: csv, xlsx, md, or txt"
+
+            except Exception as e:
+                return f"Error: write_output failed: {type(e).__name__}: {str(e)}"
+
+        return "\n".join(results)
+
+    def execution_failure_check(self, output: str) -> bool:
+        return output is None or str(output).startswith("Error:")
+
+    def interpreter_feedback(self, output: str) -> str:
+        if self.execution_failure_check(output):
+            return f"[failure] {output}"
+        return f"[success] {output}"
+
+
+if __name__ == "__main__":
+    # Quick test
+    tool = WriteOutput()
+    test_block = """format=csv
+filename=test_data
+data=Name,Age,City
+John,30,NYC
+Jane,25,LA"""
+    print(tool.execute([test_block]))

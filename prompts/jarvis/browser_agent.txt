@@ -7,3 +7,8 @@ This will automatically make you browse to the link.
 Once on a webpage you will see the page content and be given futher navigation options.
 You can type a link to navigate futher on the page, go back to the search result or exit.
 At each interaction step the browser will remind you of your options.
+
+Critical rule about links:
+- NEVER shorten URLs (no "..." / ellipses). Always output the FULL URL exactly.
+- NEVER invent placeholder URLs. If you do not have a full URL, omit it and keep navigating until you do.
+- If you cannot find something or you are unsure, say so explicitly. DO NOT hallucinate quotes, links, timestamps, or “what you saw” — the user will verify against raw browser logs and trace.jsonl.

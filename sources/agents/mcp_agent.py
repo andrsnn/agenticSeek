@@ -57,15 +57,30 @@ class McpAgent(Agent):
             return "MCP Agent is disabled."
         prompt = self.expand_prompt(prompt)
         self.memory.push('user', prompt)
+        # Guard against infinite loops: stop when the model no longer emits tool blocks.
+        # (blocks_result persists across turns, so we must track "new blocks executed this turn".)
         working = True
-        while working == True:
+        max_turns = 8
+        turns = 0
+        while working == True and not self.stop and turns < max_turns:
             animate_thinking("Thinking...", color="status")
             answer, reasoning = await self.llm_request()
             exec_success, _ = self.execute_modules(answer)
             answer = self.remove_blocks(answer)
             self.last_answer = answer
             self.status_message = "Ready"
-            if len(self.blocks_result) == 0:
+            turns += 1
+
+            executed = getattr(self, "executed_blocks_last_call", 0) or 0
+            had_parse_err = getattr(self, "had_tool_parse_error_last_call", False)
+            empty_llm = getattr(self, "last_llm_response_empty", False)
+
+            # Stop when the model no longer emits tool blocks AND we didn't detect parse/empty-response issues.
+            if executed == 0 and exec_success and not had_parse_err and not empty_llm:
+                working = False
+
+            # If a tool failed for a real reason (not just formatting/empty response), stop and surface it.
+            if not exec_success and not had_parse_err and not empty_llm:
                 working = False
         return answer, reasoning
 

@@ -1,16 +1,27 @@
 import re
 import time
+import json
 from datetime import date
 from typing import List, Tuple, Type, Dict
 from enum import Enum
 import asyncio
+import os
+import uuid
+import shutil
+import threading
 
 from sources.utility import pretty_print, animate_thinking
 from sources.agents.agent import Agent
 from sources.tools.searxSearch import searxSearch
+from sources.tools.appendFile import AppendFile
 from sources.browser import Browser
 from sources.logger import Logger
 from sources.memory import Memory
+from sources.runtime_context import trace_event, get_run_context
+from sources.ocr import ocr_image
+from sources.sources_store import add_sources as _add_sources, normalize_url as _normalize_url
+
+from sources.activity_bus import emit_activity
 
 class Action(Enum):
     REQUEST_EXIT = "REQUEST_EXIT"
@@ -27,6 +38,7 @@ class BrowserAgent(Agent):
         super().__init__(name, prompt_path, provider, verbose, browser)
         self.tools = {
             "web_search": searxSearch(),
+            "append_file": AppendFile(),
         }
         self.role = "web"
         self.type = "browser_agent"
@@ -36,12 +48,230 @@ class BrowserAgent(Agent):
         self.navigable_links = []
         self.last_action = Action.NAVIGATE.value
         self.notes = []
+        # Goal/prompt for this run (used for per-page source enrichment).
+        self._run_goal: str = ""
+        # Avoid spamming mode logs.
+        self._sources_mode_logged: bool = False
         self.date = self.get_today_date()
         self.logger = Logger("browser_agent.log")
+        self._step = 0
         self.memory = Memory(self.load_prompt(prompt_path),
                         recover_last_session=False, # session recovery in handled by the interaction class
                         memory_compression=False,
                         model_provider=provider.get_model_name() if provider else None)
+
+    def _safe_trace_write(self, rel_path: str, content: str) -> str | None:
+        """
+        Best-effort write under WORK_DIR, returns absolute path on success.
+        """
+        ctx = get_run_context()
+        if ctx is None or not ctx.is_trace_enabled():
+            return None
+        try:
+            work_dir_abs = os.path.abspath(ctx.work_dir or os.getcwd())
+            rel = str(rel_path).replace("\\", os.sep).replace("/", os.sep).lstrip(os.sep)
+            target = os.path.abspath(os.path.join(work_dir_abs, rel))
+            if os.path.commonpath([work_dir_abs, target]) != work_dir_abs:
+                return None
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content or "")
+            return target
+        except Exception:
+            return None
+
+    def _emit_activity(self, text: str, color: str = "output") -> None:
+        """
+        Emit an Activity feed line for the UI. Best-effort (never raise).
+        """
+        try:
+            ctx = get_run_context()
+        except Exception:
+            ctx = None
+        rid = getattr(ctx, "run_id", None) if ctx is not None else None
+        try:
+            emit_activity("print", run_id=rid, text=str(text), color=str(color))
+        except Exception:
+            return
+
+    def _snapshot_page(self, page_text: str | None = None) -> None:
+        """
+        In trace/raw mode, capture URL + title + screenshot + page text file.
+        Also upserts to Sources store if save_sources is enabled.
+        """
+        ctx = get_run_context()
+        if ctx is None or self.browser is None:
+            print(f"[_snapshot_page] Early return: ctx={ctx is not None}, browser={self.browser is not None}")
+            return
+
+        save_sources = getattr(ctx.trace_config, "save_sources", False)
+        trace_enabled = ctx.is_trace_enabled()
+        print(f"[_snapshot_page] trace_enabled={trace_enabled}, save_sources={save_sources}")
+
+        # Run if tracing is on OR sources is on
+        if not trace_enabled and not save_sources:
+            print(f"[_snapshot_page] Skipping: neither trace nor sources enabled")
+            return
+        try:
+            url = self.browser.get_current_url()
+            title = self.browser.get_page_title()
+        except Exception:
+            url, title = None, None
+
+        self._step += 1
+        outputs_format = getattr(ctx.trace_config, "outputs_format", "jsonl_only")
+        shot_name = None
+        shot_path = None
+        run_shot_path = None
+        text_path = None
+        ocr_text = None
+        ocr_error = None
+
+        # Screenshot capture:
+        # - In jsonl_only mode, only capture if save_web_screenshots is enabled (Max raw).
+        # - In markdown mode, capture by default (legacy behavior).
+        want_screenshot = (
+            getattr(ctx.trace_config, "save_sources", False)
+            or (outputs_format != "jsonl_only")
+            or getattr(ctx.trace_config, "save_web_screenshots", False)
+        )
+        if want_screenshot:
+            shot_name = f"trace_step_{self._step:04d}_{uuid.uuid4().hex[:8]}.png"
+            try:
+                shot_path = self.browser.screenshot_named(shot_name)
+            except Exception:
+                shot_path = None
+            if shot_path and ctx.output_dir:
+                try:
+                    shots_dir = os.path.join(ctx.output_dir, "screenshots")
+                    os.makedirs(shots_dir, exist_ok=True)
+                    run_shot_path = os.path.join(shots_dir, shot_name)
+                    shutil.copy2(shot_path, run_shot_path)
+                except Exception:
+                    run_shot_path = None
+
+            # OCR: embed extracted text into trace.jsonl (optional, Max raw).
+            if run_shot_path and getattr(ctx.trace_config, "save_web_ocr", False) and outputs_format == "jsonl_only":
+                ocr_text, ocr_error = ocr_image(run_shot_path)
+
+        # Page text file: only for markdown mode
+        if outputs_format != "jsonl_only" and page_text:
+                text_path = self._safe_trace_write(
+                    rel_path=os.path.join("trace_pages", f"trace_step_{self._step:04d}_{uuid.uuid4().hex[:8]}.md"),
+                    content=page_text,
+                )
+
+        trace_event(
+            "page_snapshot",
+            step=self._step,
+            url=url,
+            title=title,
+            screenshot_file=shot_name if shot_path else None,
+            screenshot_path=shot_path,
+            run_screenshot_path=run_shot_path,
+            page_text=(
+                page_text
+                if (outputs_format == "jsonl_only" and getattr(ctx.trace_config, "save_web_page_text", False))
+                else None
+            ),
+            page_text_path=text_path,
+            ocr_text=ocr_text,
+            ocr_error=ocr_error,
+        )
+
+        # --- SOURCES: Simple upsert if enabled (never affects navigation) ---
+        try:
+            if getattr(ctx.trace_config, "save_sources", False) and url and url.startswith("http"):
+                rid = getattr(ctx, "run_id", None)
+                out_dir = getattr(ctx, "output_dir", None)
+                if rid:
+                    # Build simple source record
+                    screenshot_paths = []
+                    if shot_name and run_shot_path:
+                        screenshot_paths = [os.path.join("screenshots", shot_name).replace("\\", "/")]
+                    verbatim_context = []
+                    if ocr_text:
+                        verbatim_context.append(str(ocr_text).strip()[:1500])
+                    if page_text:
+                        verbatim_context.append(str(page_text).strip()[:1500])
+
+                    # Default source record (raw) - upsert immediately so we have data even if LLM fails
+                    source_rec = {
+                        "url": url,
+                        "kind": "web",
+                        "title": title or "",
+                        "relevancy_score": None,
+                        "match": "",
+                        "how_helps": "",
+                        "data_to_collect": [],
+                        "evidence_quotes": [],
+                        "verbatim_context": verbatim_context[:2],
+                        "screenshot_paths": screenshot_paths[:4],
+                    }
+
+                    print(f"[Sources] Upserting (raw): {url[:80]}...")
+                    added, total = _add_sources(
+                        rid,
+                        [source_rec],
+                        step_id=f"web_{self._step}",
+                        agent="Web",
+                        output_dir=out_dir,
+                    )
+                    print(f"[Sources] Done: added={added}, total={total}")
+
+                    # Optional LLM enrichment in BACKGROUND THREAD (fire-and-forget, never blocks navigation)
+                    if getattr(ctx.trace_config, "save_sources_llm", False) and self._run_goal:
+                        def _enrich_source_bg():
+                            try:
+                                print(f"[Sources BG] LLM enrichment for: {url[:60]}...")
+                                raw_ctx = "\n".join(verbatim_context)[:2500]
+                                system = (
+                                    "You score and summarize web sources. Return ONLY valid JSON.\n"
+                                    "Schema: {\"relevancy_score\": 0.0, \"match\": \"...\", \"how_helps\": \"...\", "
+                                    "\"data_to_collect\": [\"...\"], \"evidence_quotes\": [\"...\"]}\n"
+                                    "Rules:\n"
+                                    "- relevancy_score: 0.0 (irrelevant) to 1.0 (directly answers goal)\n"
+                                    "- match: 1 sentence on why this source matches the goal\n"
+                                    "- how_helps: 1 sentence on how this helps answer the goal\n"
+                                    "- data_to_collect: 2-4 bullet points of key data found\n"
+                                    "- evidence_quotes: 1-3 short verbatim quotes from the page\n"
+                                    "Do NOT invent data. Use ONLY what's in the page content."
+                                )
+                                user_msg = f"GOAL: {self._run_goal}\n\nURL: {url}\nTITLE: {title}\n\nPAGE CONTENT:\n{raw_ctx}"
+                                llm_out = self.llm.respond([{"role": "system", "content": system}, {"role": "user", "content": user_msg}], False)
+                                # Parse JSON from response
+                                txt = str(llm_out or "").strip()
+                                import re as _re
+                                m = _re.search(r"\{[\s\S]*\}", txt)
+                                if m:
+                                    data = json.loads(m.group(0))
+                                    if isinstance(data, dict):
+                                        enriched = {"url": url}
+                                        if "relevancy_score" in data:
+                                            try:
+                                                enriched["relevancy_score"] = max(0.0, min(1.0, float(data["relevancy_score"])))
+                                            except:
+                                                pass
+                                        if data.get("match"):
+                                            enriched["match"] = str(data["match"])[:500]
+                                        if data.get("how_helps"):
+                                            enriched["how_helps"] = str(data["how_helps"])[:500]
+                                        if isinstance(data.get("data_to_collect"), list):
+                                            enriched["data_to_collect"] = [str(x)[:200] for x in data["data_to_collect"][:6]]
+                                        if isinstance(data.get("evidence_quotes"), list):
+                                            enriched["evidence_quotes"] = [str(x)[:300] for x in data["evidence_quotes"][:4]]
+                                        # Upsert enriched data (merges with existing raw record)
+                                        _add_sources(rid, [enriched], step_id=f"web_{self._step}_enriched", agent="Web", output_dir=out_dir)
+                                        print(f"[Sources BG] LLM enrichment done: score={enriched.get('relevancy_score')}")
+                            except Exception as bg_err:
+                                print(f"[Sources BG] LLM enrichment failed: {type(bg_err).__name__}: {bg_err}")
+
+                        # Spawn daemon thread - will be killed on process exit, never blocks main thread
+                        t = threading.Thread(target=_enrich_source_bg, daemon=True)
+                        t.start()
+                        print(f"[Sources] LLM enrichment spawned in background thread")
+        except Exception as e:
+            print(f"[Sources] Error (ignored): {type(e).__name__}: {e}")
     
     def get_today_date(self) -> str:
         """Get the date"""
@@ -75,7 +305,8 @@ class BrowserAgent(Agent):
         return links_clean
 
     def get_unvisited_links(self) -> List[str]:
-        return "\n".join([f"[{i}] {link}" for i, link in enumerate(self.navigable_links) if link not in self.search_history])
+        visited_norm = set(_normalize_url(h) for h in self.search_history if h)
+        return "\n".join([f"[{i}] {link}" for i, link in enumerate(self.navigable_links) if _normalize_url(link) not in visited_norm])
 
     def make_newsearch_prompt(self, prompt: str, search_result: dict) -> str:
         search_choice = self.stringify_search_results(search_result)
@@ -119,6 +350,7 @@ class BrowserAgent(Agent):
 
         1. **Evaluate if the page is relevant for user’s query and document finding:**
           - If the page is relevant, extract and summarize key information in concise notes (Note: <your note>)
+          - Include a short "Match:" clause in the Note that explicitly states what matches the user request (e.g. Match: mentions moissanite tennis necklace, price shown, ships to Atlanta).
           - If page not relevant, state: "Error: <specific reason the page does not address the query>" and either return to the previous page or navigate to a new link.
           - Notes should be factual, useful summaries of relevant content, they should always include specific names or link. Written as: "On <website URL>, <key fact 1>. <Key fact 2>. <Additional insight>." Avoid phrases like "the page provides" or "I found that."
         2. **Navigate to a link by either: **
@@ -188,9 +420,12 @@ class BrowserAgent(Agent):
         return answer, reasoning
     
     def select_unvisited(self, search_result: List[str]) -> List[str]:
+        # Build normalized set of visited URLs
+        visited_norm = set(_normalize_url(h) for h in self.search_history if h)
         results_unvisited = []
         for res in search_result:
-            if res["link"] not in self.search_history:
+            link = res.get("link") or ""
+            if _normalize_url(link) not in visited_norm:
                 results_unvisited.append(res) 
         self.logger.info(f"Unvisited links: {results_unvisited}")
         return results_unvisited
@@ -231,16 +466,33 @@ class BrowserAgent(Agent):
                 buffer.append(line.replace("notes:", ''))
             else:
                 links.extend(self.extract_links(line))
-        self.notes.append('. '.join(buffer).strip())
+        note = '. '.join(buffer).strip()
+        # Ensure notes carry a real URL so downstream summaries/reports can include correct links.
+        try:
+            current_url = self.browser.get_current_url() if self.browser else None
+        except Exception:
+            current_url = None
+        if current_url and note and ("http://" not in note and "https://" not in note and "www." not in note):
+            note = f"On {current_url}, {note}"
+        self.notes.append(note)
         return links
     
     def select_link(self, links: List[str]) -> str | None:
         """
         Select the first unvisited link that is not the current page.
         Preference is given to links not in search_history.
+        Uses normalized URLs to avoid loops caused by tracking params (srsltid, utm_*, etc).
         """
+        # Build normalized set of visited URLs for fast lookup
+        visited_norm = set()
+        for h in self.search_history:
+            if h:
+                visited_norm.add(_normalize_url(h))
+        current_norm = _normalize_url(self.current_page) if self.current_page else ""
+
         for lk in links:
-            if lk == self.current_page or lk in self.search_history:
+            lk_norm = _normalize_url(lk)
+            if lk_norm == current_norm or lk_norm in visited_norm:
                 self.logger.info(f"Skipping already visited or current link: {lk}")
                 continue
             self.logger.info(f"Selected link: {lk}")
@@ -342,6 +594,8 @@ class BrowserAgent(Agent):
         complete = False
 
         animate_thinking(f"Thinking...", color="status")
+        trace_event("browser_agent_start", user_prompt=user_prompt)
+        self._run_goal = str(user_prompt or "")
         mem_begin_idx = self.memory.push('user', self.search_prompt(user_prompt))
         ai_prompt, reasoning = await self.llm_request()
         if Action.REQUEST_EXIT.value in ai_prompt:
@@ -349,8 +603,16 @@ class BrowserAgent(Agent):
             return ai_prompt, "" 
         animate_thinking(f"Searching...", color="status")
         self.status_message = "Searching..."
+        ctx = get_run_context()
+        if ctx is None or getattr(ctx.trace_config, "save_web_navigation", True):
+            trace_event("web_search_query", query=ai_prompt)
         search_result_raw = self.tools["web_search"].execute([ai_prompt], False)
         search_result = self.jsonify_search_results(search_result_raw)[:16]
+        # Persist structured search results so full URLs are always available in the trace,
+        # even if an LLM later abbreviates links in a summary.
+        ctx_nav = get_run_context()
+        if ctx_nav is None or getattr(ctx_nav.trace_config, "save_web_navigation", True):
+            trace_event("web_search_results", results=search_result)
         self.show_search_results(search_result)
         prompt = self.make_newsearch_prompt(user_prompt, search_result)
         unvisited = [None]
@@ -373,6 +635,7 @@ class BrowserAgent(Agent):
                 pretty_print(f"Filling inputs form...", color="status")
                 fill_success = self.browser.fill_form(extracted_form)
                 page_text = self.get_page_text(limit_to_model_ctx=True)
+                self._snapshot_page(page_text=page_text)
                 answer = self.handle_update_prompt(user_prompt, page_text, fill_success)
                 answer, reasoning = await self.llm_decide(prompt)
 
@@ -380,10 +643,19 @@ class BrowserAgent(Agent):
                 pretty_print(f"Filled form. Handling page update.", color="status")
                 page_text = self.get_page_text(limit_to_model_ctx=True)
                 self.navigable_links = self.browser.get_navigable()
+                self._snapshot_page(page_text=page_text)
                 prompt = self.make_navigation_prompt(user_prompt, page_text)
                 continue
 
             links = self.parse_answer(answer)
+            # Emit any new notes taken this turn.
+            if self.notes:
+                try:
+                    cur_url = self.browser.get_current_url() if self.browser else None
+                    cur_title = self.browser.get_page_title() if self.browser else None
+                except Exception:
+                    cur_url, cur_title = None, None
+                trace_event("browser_notes", notes=self.notes[-1], url=cur_url, title=cur_title)
             link = self.select_link(links)
             if link == self.current_page:
                 pretty_print(f"Already visited {link}. Search callback.", color="status")
@@ -397,7 +669,9 @@ class BrowserAgent(Agent):
                 complete = True
                 break
 
-            if (link == None and len(extracted_form) < 3) or Action.GO_BACK.value in answer or link in self.search_history:
+            # Check if link is already visited (using normalized URL to handle tracking params)
+            link_already_visited = link and any(_normalize_url(link) == _normalize_url(h) for h in self.search_history if h)
+            if (link == None and len(extracted_form) < 3) or Action.GO_BACK.value in answer or link_already_visited:
                 pretty_print(f"Going back to results. Still {len(unvisited)}", color="status")
                 self.status_message = "Going back to search results..."
                 request_prompt = user_prompt
@@ -410,20 +684,52 @@ class BrowserAgent(Agent):
 
             animate_thinking(f"Navigating to {link}", color="status")
             if speech_module: speech_module.speak(f"Navigating to {link}")
+            ctx = get_run_context()
+            if ctx is None or getattr(ctx.trace_config, "save_web_navigation", True):
+                trace_event("web_navigate", url=link)
             nav_ok = self.browser.go_to(link)
-            self.search_history.append(link)
+            # Always store the *actual* URL post-navigation so sources are never placeholders.
+            actual_url = None
+            try:
+                actual_url = self.browser.get_current_url()
+            except Exception:
+                actual_url = None
+            self.search_history.append(actual_url or link)
             if not nav_ok:
                 pretty_print(f"Failed to navigate to {link}.", color="failure")
                 prompt = self.make_newsearch_prompt(user_prompt, unvisited)
                 continue
-            self.current_page = link
+            self.current_page = actual_url or link
             page_text = self.get_page_text(limit_to_model_ctx=True)
             self.navigable_links = self.browser.get_navigable()
+            self._snapshot_page(page_text=page_text)
             prompt = self.make_navigation_prompt(user_prompt, page_text)
             self.status_message = "Navigating..."
             self.browser.screenshot()
 
         pretty_print("Exited navigation, starting to summarize finding...", color="status")
+        # Emit consolidated browser history (easy to copy out of a single JSONL event).
+        try:
+            ctx = get_run_context()
+            if ctx is None or getattr(ctx.trace_config, "save_web_history", True):
+                urls = []
+                for u in (self.search_history or []):
+                    if isinstance(u, str) and u.startswith("http") and "..." not in u:
+                        urls.append(u.strip().rstrip(").,;]"))
+                if isinstance(self.current_page, str) and self.current_page.startswith("http") and "..." not in self.current_page:
+                    urls.append(self.current_page.strip().rstrip(").,;]"))
+                # de-dupe, preserve order
+                seen = set()
+                deduped = []
+                for u in urls:
+                    if not u or u in seen:
+                        continue
+                    seen.add(u)
+                    deduped.append(u)
+                if deduped:
+                    trace_event("browser_history", urls=deduped)
+        except Exception:
+            pass
         prompt = self.conclude_prompt(user_prompt)
         mem_last_idx = self.memory.push('user', prompt)
         self.status_message = "Summarizing findings..."

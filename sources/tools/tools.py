@@ -41,6 +41,7 @@ class Tools():
         self.config = configparser.ConfigParser()
         self.work_dir = self.create_work_dir()
         self.excutable_blocks_found = False
+        self.last_parse_error = None
         self.safe_mode = False
         self.allow_language_exec_bash = False
     
@@ -61,17 +62,47 @@ class Tools():
     
     def config_exists(self):
         """Check if the config file exists."""
-        return os.path.exists('./config.ini')
+        # Note: do not rely on current working directory; callers may run from /app in Docker.
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        return os.path.exists(os.path.join(repo_root, 'config.ini'))
 
     def create_work_dir(self):
-        """Create the work directory if it does not exist."""
-        default_path = os.path.dirname(os.getcwd())
-        if self.config_exists():
-            self.config.read('./config.ini')
-            workdir_path = self.safe_get_work_dir_path()
-        else:
-            workdir_path = default_path
-        return workdir_path
+        """Resolve the work directory.
+
+        Priority:
+        1) WORK_DIR env var (set by docker-compose to the mounted workspace in-container)
+        2) config.ini (repo root) [MAIN].work_dir
+        3) repo root
+        """
+        # 1) Prefer env var (docker-compose sets this to /opt/workspace)
+        env_path = os.getenv("WORK_DIR")
+        if env_path:
+            try:
+                os.makedirs(env_path, exist_ok=True)
+            except Exception:
+                # Don't hard-fail on permission issues; still return it so callers can surface errors.
+                pass
+            return env_path
+
+        # 2) Load config.ini from repo root (do NOT depend on CWD)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        config_path = os.path.join(repo_root, "config.ini")
+        if os.path.exists(config_path):
+            self.config.read(config_path)
+            cfg_path = None
+            try:
+                cfg_path = self.config.get("MAIN", "work_dir", fallback=None)
+            except Exception:
+                cfg_path = None
+            if cfg_path:
+                try:
+                    os.makedirs(cfg_path, exist_ok=True)
+                except Exception:
+                    pass
+                return cfg_path
+
+        # 3) Fallback: repo root
+        return repo_root
 
     @abstractmethod
     def execute(self, blocks:[str], safety:bool) -> str:
@@ -118,14 +149,22 @@ class Tools():
         if save_path is None:
             return
         self.logger.info(f"Saving blocks to {save_path}")
-        save_path_dir = os.path.dirname(save_path)
-        save_path_file = os.path.basename(save_path)
-        directory = os.path.join(self.work_dir, save_path_dir)
+        # Normalize and ensure writes stay under work_dir even if the LLM outputs an absolute-ish path.
+        work_dir_abs = os.path.abspath(self.work_dir)
+        # Remove any drive/leading separators by treating save_path as relative intent.
+        save_path_norm = save_path.replace("\\", os.sep).replace("/", os.sep)
+        save_path_norm = save_path_norm.lstrip(os.sep)
+        target_path = os.path.abspath(os.path.join(work_dir_abs, save_path_norm))
+        if os.path.commonpath([work_dir_abs, target_path]) != work_dir_abs:
+            raise ValueError(f"Refusing to write outside work_dir. save_path={save_path}")
+
+        directory = os.path.dirname(target_path)
+        save_path_file = os.path.basename(target_path)
         if directory and not os.path.exists(directory):
             self.logger.info(f"Creating directory {directory}")
-            os.makedirs(directory)
+            os.makedirs(directory, exist_ok=True)
         for block in blocks:
-            with open(os.path.join(directory, save_path_file), 'w') as f:
+            with open(os.path.join(directory, save_path_file), 'w', encoding="utf-8") as f:
                 f.write(block)
     
     def get_parameter_value(self, block: str, parameter_name: str) -> str:
@@ -162,6 +201,7 @@ class Tools():
                 - List of extracted and processed code blocks
                 - The path the code blocks was saved to
         """
+        self.last_parse_error = None
         assert self.tag != "undefined", "Tag not defined"
         start_tag = f'```{self.tag}' 
         end_tag = '```'
@@ -182,6 +222,8 @@ class Tools():
 
             end_pos = llm_text.find(end_tag, start_pos + len(start_tag))
             if end_pos == -1:
+                # Malformed tool block (missing closing fence). Signal parse error so agents can retry.
+                self.last_parse_error = f"Malformed ```{self.tag} block: missing closing ```"
                 break
             content = llm_text[start_pos + len(start_tag):end_pos]
             lines = content.split('\n')
@@ -201,6 +243,11 @@ class Tools():
             code_blocks.append(content)
             start_index = end_pos + len(end_tag)
         self.logger.info(f"Found {len(code_blocks)} blocks to execute")
+        if len(code_blocks) == 0:
+            # start_tag existed, but we didn't extract a complete block -> treat as parse error.
+            if self.last_parse_error is None:
+                self.last_parse_error = f"Malformed ```{self.tag} block: could not extract any complete fenced block"
+            return None, None
         return code_blocks, save_path
     
 if __name__ == "__main__":

@@ -46,3 +46,5 @@ openai
 sniffio
 ordered_set
 pypinyin
+pytesseract>=0.3.13
+Pillow>=10.4.0

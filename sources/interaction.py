@@ -1,3 +1,4 @@
+import os
 import readline
 from typing import List, Tuple, Type, Dict
 
@@ -6,7 +7,11 @@ from sources.utility import pretty_print, animate_thinking
 from sources.router import AgentRouter
 from sources.speech_to_text import AudioTranscriber, AudioRecorder
 import threading
+from sources.runtime_context import get_run_context, trace_event, RunMode
 
+from sources.deep_research import DeepResearchOrchestrator
+from sources.workdir import resolve_work_dir
+from sources import artifacts
 
 class Interaction:
     """
@@ -33,6 +38,7 @@ class Interaction:
         self.transcriber = None
         self.recorder = None
         self.is_generating = False
+        self._queued_queries = []
         self.languages = langs
         if tts_enabled:
             self.initialize_tts()
@@ -41,6 +47,25 @@ class Interaction:
         if recover_last_session:
             self.load_last_session()
         self.emit_status()
+
+    def enqueue(self, query: str) -> int:
+        """
+        Queue a query to be executed after the current one finishes.
+        Returns the new queue length.
+        """
+        if query is None or str(query).strip() == "":
+            return len(self._queued_queries)
+        self._queued_queries.append(str(query))
+        trace_event("queued", query=query, queue_len=len(self._queued_queries))
+        return len(self._queued_queries)
+
+    def queued_len(self) -> int:
+        return len(self._queued_queries)
+
+    def pop_next_queued(self) -> str | None:
+        if not self._queued_queries:
+            return None
+        return self._queued_queries.pop(0)
     
     def get_spoken_language(self) -> str:
         """Get the primary TTS language."""
@@ -151,22 +176,88 @@ class Interaction:
         push_last_agent_memory = False
         if self.last_query is None or len(self.last_query) == 0:
             return False
+        ctx = get_run_context()
+        trace_event("user_query", query=self.last_query)
+        # Persist original query early (so you get it even mid-run)
+        if ctx is not None and ctx.is_trace_enabled() and ctx.trace_config.save_query:
+            artifacts.write_text("query.txt", self.last_query + "\n", append=False)
+
+        # Deep research mode bypasses the normal router/agent loop.
+        if ctx is not None and ctx.mode == RunMode.DEEP_RESEARCH:
+            work_dir = (ctx.work_dir if ctx.work_dir else resolve_work_dir())
+            if ctx.findings_file:
+                ff = str(ctx.findings_file)
+                if os.path.isabs(ff):
+                    try:
+                        findings_rel = os.path.relpath(ff, work_dir)
+                    except Exception:
+                        findings_rel = os.path.basename(ff)
+                else:
+                    findings_rel = ff
+            else:
+                findings_rel = "deep_research_findings.md"
+            orch = DeepResearchOrchestrator(work_dir=work_dir, findings_relpath=findings_rel)
+            self.current_agent = None
+            self.is_generating = True
+            trace_event("interaction_working", state="start", mode="deep_research")
+            self.last_answer, self.last_reasoning = orch.run(self.last_query)
+            trace_event("interaction_working", state="end", mode="deep_research")
+            self.is_generating = False
+            trace_event("final_answer", answer=self.last_answer)
+            if ctx.trace_config.save_final_answer and self.last_answer:
+                artifacts.write_text("final_answer.md", self.last_answer + "\n", append=False)
+            return True
+
         agent = self.router.select_agent(self.last_query)
         if agent is None:
             return False
+        # Reset per-run state so previous stop/failure doesn't leak into a new user query.
+        try:
+            if hasattr(agent, "reset_run_state"):
+                agent.reset_run_state()
+            else:
+                agent.success = True
+                agent.stop = False
+        except Exception:
+            pass
+        # Ensure all tool/file writes for this query go under runs/<run_id>/...
+        try:
+            if hasattr(agent, "apply_run_context"):
+                agent.apply_run_context()
+        except Exception:
+            pass
         if self.current_agent != agent and self.last_answer is not None:
             push_last_agent_memory = True
         tmp = self.last_answer
         self.current_agent = agent
         self.is_generating = True
+        trace_event("interaction_working", state="start", mode="standard")
+        trace_event("selected_agent", agent_type=agent.type, agent_name=agent.agent_name)
         self.last_answer, self.last_reasoning = await agent.process(self.last_query, self.speech)
+        trace_event("interaction_working", state="end", mode="standard")
         self.is_generating = False
         if push_last_agent_memory:
             self.current_agent.memory.push('user', self.last_query)
             self.current_agent.memory.push('assistant', self.last_answer)
         if self.last_answer == tmp:
             self.last_answer = None
+        trace_event("final_answer", answer=self.last_answer)
+        # Persist final answer (even in standard mode if trace is on)
+        if ctx is not None and ctx.is_trace_enabled() and ctx.trace_config.save_final_answer and self.last_answer:
+            artifacts.write_text("final_answer.md", self.last_answer + "\n", append=False)
         return True
+
+    async def drain_queue(self) -> None:
+        """
+        Process all queued queries sequentially.
+        Intended for CLI usage.
+        """
+        while self.is_active and self.queued_len() > 0:
+            nxt = self.pop_next_queued()
+            if nxt is None:
+                break
+            self.set_query(nxt)
+            await self.think()
     
     def get_updated_process_answer(self) -> str:
         """Get the answer from the last agent."""

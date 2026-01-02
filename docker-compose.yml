@@ -65,13 +65,15 @@ services:
     environment:
       - NODE_ENV=development
       - CHOKIDAR_USEPOLLING=true
-      - REACT_APP_BACKEND_URL=http://localhost:7777
+      # Leave blank so the frontend auto-targets the same host (works on LAN/phone)
+      - REACT_APP_BACKEND_URL=
     networks:
       - agentic-seek-net
 
   backend:
     container_name: backend
     profiles: ["backend", "full"]
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile.backend
