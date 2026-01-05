@@ -23,6 +23,18 @@ Think of it like having a personal AI researcher that can:
 
 ---
 
+## Screenshots
+
+<p align="center">
+<img src="./screenshots/Screenshot 2026-01-02 101201.png" alt="AgenticSeek UI - Sources Panel" width="100%">
+</p>
+
+<p align="center">
+<img src="./screenshots/Screenshot 2026-01-02 103047.png" alt="AgenticSeek UI - Report Generation" width="100%">
+</p>
+
+---
+
 ## Why This Fork?
 
 The original AgenticSeek is a fantastic project. This fork builds on it with quality-of-life improvements, better reliability, and new features that make it more usable day-to-day.
